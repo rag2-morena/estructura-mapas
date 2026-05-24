@@ -120,7 +120,7 @@ def get_token():
     r.raise_for_status()
     return r.json()['access_token']
 
-   def get_device_list(token, page_num=1):
+def get_device_list(token, page_num=1):
     r = requests.post(
         f"{KNOX_BASE}/emm/oapi/device/selectDeviceList",
         headers={'Authorization': f'bearer {token}'},
