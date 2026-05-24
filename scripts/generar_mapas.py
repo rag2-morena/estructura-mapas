@@ -218,6 +218,10 @@ def descargar_dispositivos():
 
 # Deduplicar por deviceId o IMEI o serialNumber
     seen, unique = set(), []
+    none_count = sum(1 for d in all_devices if not d.get('deviceId'))
+    print(f"  Dispositivos sin deviceId: {none_count} de {len(all_devices)}")
+    imei_sample = [(d.get('deviceId'), d.get('imei')) for d in all_devices[:5]]
+    print(f"  Muestra IDs: {imei_sample}")
     for d in all_devices:
         key = d.get('deviceId') or str(d.get('imei','')) or d.get('serialNumber','')
         if key and key not in seen:
