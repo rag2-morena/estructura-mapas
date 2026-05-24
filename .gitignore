@@ -3,3 +3,9 @@ __pycache__/
 .env
 *.log
 docs/*.html
+.DS_Store
+scripts/.DS_Store
+scripts/files/
+scripts/files.zip
+scripts/anterior_generar_mapas.py
+scripts/generar_mapas.yml
