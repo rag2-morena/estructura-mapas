@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 generar_mapas.py
-Lee el Excel de Knox (Tabletas_Estructura.xlsx) y genera 35 HTML por entidad.
-Ejecutado por GitHub Actions cuando se sube un nuevo Excel.
+Consulta Knox Manage API y genera 35 HTML por entidad.
+Ejecutado por GitHub Actions cada 2 horas.
 """
-import pandas as pd
-import json, os, re
+import requests, json, os, re, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── Configuracion ──────────────────────────────────────────────────
+KNOX_BASE   = os.environ['KNOX_BASE_URL'].rstrip('/')
+KNOX_CLIENT = os.environ['KNOX_CLIENT_ID']
+KNOX_SECRET = os.environ['KNOX_SECRET']
 OUTPUT_DIR  = Path('docs')
-DATA_DIR    = Path('data')
 ZONA_MEXICO = timezone(timedelta(hours=-6))
 FECHA_HOY   = datetime.now(ZONA_MEXICO).strftime('%d/%m/%Y %H:%M hora Centro')
 
@@ -48,7 +49,7 @@ ESTADOS = {
     '30':('Veracruz','Veracruz'),
     '31':('Yucatan','Yucatan'),
     '32':('Zacatecas','Zacatecas'),
-    'COTS_REFUERZO':('COTS_Refuerzo','COTS Refuerzo'),
+    'COTS':('COTS_Refuerzo','COTS Refuerzo'),
     'DISTRITALES':('Distritales','Distritales'),
     'FINANZAS':('Finanzas','Finanzas'),
 }
@@ -74,7 +75,7 @@ _base = {
     '17':['17_Morelos','Estruct_Morelos'],
     '18':['18_Nayarit','Estruct_Nayarit'],
     '19':['19_Nuevo_Leon','Estruct_NL'],
-    '20':['20_Oaxaca','Oaxacaa','Estruct_Oax','Oaxaca_ROBADOS'],
+    '20':['20_Oaxaca','Oaxacaa','Estruct_Oax','Oaxaca'],
     '21':['21_Puebla','ESTRUCTURA_PUEBLA','Estruct_Puebla'],
     '22':['22_Queretaro','Estruct_Queretaro'],
     '23':['23_Quintana Roo','Estruct_Quintana Roo'],
@@ -101,171 +102,199 @@ ETIQUETA_MAP.update({
     'Estruct_Campeche_ROBADOS':'04','Estruct_Puebla_ROBADOS':'21',
     'ESTRUCTURA_PUEBLA_ROBADOS':'21','Estruct_Queretaro_EXTRAVIADOS':'22',
     'Estruct_SLP_ROBADOS':'24','11_Guanajuato_ROBADOS':'11',
-    '_EDOMEX_ROBADOS':'15',
+    '_EDOMEX_ROBADOS':'15','Estruct_EDOMEX_ROBADOS':'15',
 })
 
-# ── Parsear GPS ────────────────────────────────────────────────────
-def parse_gps(val):
-    if pd.isna(val) or str(val).strip() == '':
+# ── Knox API ───────────────────────────────────────────────────────
+def get_token():
+    r = requests.get(
+        KNOX_BASE + '/emm/oauth/token',
+        params={
+            'grant_type':    'client_credentials',
+            'client_id':     KNOX_CLIENT,
+            'client_secret': KNOX_SECRET,
+        },
+        timeout=30
+    )
+    r.raise_for_status()
+    return r.json()['access_token']
+
+
+def get_device_list(token, page_num=1):
+    r = requests.post(
+        KNOX_BASE + '/emm/oapi/device/selectDeviceList',
+        headers={'Authorization': 'bearer ' + token},
+        data={'pageNum': str(page_num), 'pageSize': '1000'},
+        timeout=60
+    )
+    r.raise_for_status()
+    data = r.json()
+    rv = data.get('resultValue', {})
+    # Log IMEIs de primeras 2 paginas para diagnostico
+    if page_num <= 2:
+        imeis = [d.get('imei', '') for d in rv.get('deviceList', [])[:3]]
+        print('  p' + str(page_num) + ' primeros IMEIs: ' + str(imeis))
+    return {
+        'total':      int(rv.get('total', 0)),
+        'deviceList': rv.get('deviceList', []),
+        'resultCode': str(data.get('resultCode', '-1')),
+    }
+
+
+def get_device_location(token, device_id, mobile_id):
+    try:
+        r = requests.post(
+            KNOX_BASE + '/emm/oapi/device/selectDeviceLocation',
+            headers={'Authorization': 'bearer ' + token},
+            data={'deviceId': device_id, 'mobileId': mobile_id},
+            timeout=15
+        )
+        if not r.ok:
+            return None, None
+        data = r.json()
+        if str(data.get('resultCode')) != '0':
+            return None, None
+        loc = data.get('resultValue', {})
+        lat = float(loc['latitude'])  if loc.get('latitude')  else None
+        lng = float(loc['longitude']) if loc.get('longitude') else None
+        return lat, lng
+    except Exception:
         return None, None
-    m = re.match(r'([-\d.]+),\s*([-\d.]+)\s*\(([^)]+)\)', str(val).strip())
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    return None, None
 
 # ── Clasificacion ──────────────────────────────────────────────────
-def clasificar(grupo_raw, etiqueta_raw):
-    g = str(grupo_raw).strip() if not pd.isna(grupo_raw) else ''
-    e = str(etiqueta_raw).strip() if not pd.isna(etiqueta_raw) else ''
-    tokens = [t.strip() for t in g.split(',') if t.strip()]
+def clasificar(tags):
+    for tag in tags:
+        tv = (tag.get('tagValue') or '').strip()
+        if not tv:
+            continue
+        if tv in ETIQUETA_MAP:
+            return ETIQUETA_MAP[tv]
+        for suf in SUFIJOS:
+            if tv.endswith(suf):
+                base = tv[:-len(suf)]
+                if base in ETIQUETA_MAP:
+                    return ETIQUETA_MAP[base]
+        m = re.match(r'^(\d{2})_', tv)
+        if m and m.group(1) in ESTADOS:
+            return m.group(1)
+        m2 = re.match(r'^(\d)_', tv)
+        if m2 and '0' + m2.group(1) in ESTADOS:
+            return '0' + m2.group(1)
+        if re.match(r'^05_COTS-REFUERZO', tv, re.I):
+            return 'COTS'
+        if re.match(r'^DISTRITALES$', tv, re.I):
+            return 'DISTRITALES'
+        if re.match(r'^Fin_', tv, re.I):
+            return 'FINANZAS'
+        if re.match(r'^Finanzas$', tv, re.I):
+            return 'FINANZAS'
+    return None
 
-    if e.startswith('Fin_') or e == 'Finanzas':
-        return 'FINANZAS', False
 
-    estados_grupo = []
-    for tok in tokens:
-        m = re.match(r'^(\d{2})_(?:Estructura|Proceso)_', tok, re.I)
-        if m and m.group(1).zfill(2) in ESTADOS:
-            estados_grupo.append(m.group(1).zfill(2))
-
-    tiene_cots   = any(re.match(r'^05_COTS-REFUERZO$', t, re.I) for t in tokens)
-    tiene_brigad = any(re.match(r'^05_Estructura_BRIGADISTAS$', t, re.I) for t in tokens)
-    tiene_dist   = any(t.upper() == 'DISTRITALES' for t in tokens)
-    tiene_fin    = any(t.upper() == 'FINANZAS' for t in tokens)
-
-    if estados_grupo:
-        return estados_grupo[0], tiene_cots
-    if tiene_brigad:
-        return '05', False
-    if tiene_cots:
-        return 'COTS_REFUERZO', False
-    if tiene_dist:
-        return 'DISTRITALES', False
-    if tiene_fin:
-        return 'FINANZAS', False
-    if e in ETIQUETA_MAP:
-        return ETIQUETA_MAP[e], False
-    if 'REF_PROCESO_RS' in e.upper() or 'PROCESO_COAHUILA' in e.upper():
-        return '05', False
-
-    return None, False
-
-def get_incidencia(etiqueta, grupo):
-    t = ((str(etiqueta) if not pd.isna(etiqueta) else '') + ' ' +
-         (str(grupo) if not pd.isna(grupo) else '')).upper()
-    if 'ROBADO' in t:     return 'ROBADO'
-    if 'EXTRAVIADO' in t: return 'EXTRAVIADO'
+def get_incidencia(tags):
+    txt = ' '.join(t.get('tagValue', '') for t in tags).upper()
+    if 'ROBADO' in txt:
+        return 'ROBADO'
+    if 'EXTRAVIADO' in txt:
+        return 'EXTRAVIADO'
     return ''
 
-def get_estatus(visto_str, estado_mdm, inc):
-    if inc in ('ROBADO', 'EXTRAVIADO'):
+
+def get_estatus(device, inc):
+    if inc:
         return 'robado'
-    mdm = str(estado_mdm).strip().lower()
-    if 'licencia ha caducado' in mdm or mdm == 'suministro':
-        return 'caducada'
-    if 'no inscrito' in mdm:
+    if device.get('deviceStatus', '') != 'A':
         return 'offline'
-    if not visto_str or visto_str == 'nan':
+    visto = device.get('stdFormatLastConnectionDate', '')
+    if not visto:
         return 'offline'
-    m = re.match(r'^(\d+)([dhm])', visto_str)
-    if m:
-        n, u = int(m.group(1)), m.group(2)
-        dias = n if u == 'd' else n/24 if u == 'h' else n/1440
-        if dias <= 3:  return 'activo'
-        if dias <= 60: return 'offline'
+    try:
+        dt   = datetime.fromisoformat(visto.replace('Z', '+00:00'))
+        dias = (datetime.now(timezone.utc) - dt).days
+        if dias <= 3:
+            return 'activo'
+        if dias <= 60:
+            return 'offline'
         return 'caducada'
-    return 'activo'
+    except Exception:
+        return 'offline'
 
-# ── Leer Excel ────────────────────────────────────────────────────
-def leer_excel():
-    # Buscar el Excel en la carpeta data/
-    excels = list(DATA_DIR.glob('*.xlsx')) + list(DATA_DIR.glob('*.xls'))
-    if not excels:
-        raise FileNotFoundError('No se encontro ningun archivo Excel en la carpeta data/')
+# ── Descarga completa ──────────────────────────────────────────────
+def descargar_dispositivos():
+    print('Obteniendo token Knox...')
+    token       = get_token()
+    all_devices = []
+    page_num    = 1
+    total       = 0
 
-    xlsx = sorted(excels)[-1]  # el mas reciente
-    print('Leyendo Excel: ' + str(xlsx))
-    df = pd.read_excel(xlsx)
-    print('Total filas: ' + str(len(df)))
-    print('Columnas: ' + str(df.columns.tolist()))
-    return df
+    while True:
+        print('  Pagina ' + str(page_num) + '...')
+        page = get_device_list(token, page_num)
+        if page['resultCode'] != '0' or not page['deviceList']:
+            break
+        all_devices.extend(page['deviceList'])
+        total = page['total']
+        print('  -> ' + str(len(all_devices)) + ' de ' + str(total))
+        if len(all_devices) >= total:
+            break
+        page_num += 1
+        time.sleep(1)
 
-# ── Clasificar filas ───────────────────────────────────────────────
-def procesar_df(df):
-    # Detectar columnas por posicion (A=0, B=1, ... I=8)
-    col_estado   = df.columns[0]   # A - Estado (estatus MDM)
-    col_visto    = df.columns[1]   # B - Visto por ultima vez
-    col_imei     = df.columns[2]   # C - IMEI/MEID
-    col_serie    = df.columns[3]   # D - Numero de serie
-    col_etiqueta = df.columns[4]   # E - Etiqueta del dispositivo
-    col_tel      = df.columns[5]   # F - Numero de telefono
-    col_grupo    = df.columns[6]   # G - Grupo asignado
-    col_gps      = df.columns[7]   # H - Ultima ubicacion
-    col_apps     = df.columns[8] if len(df.columns) > 8 else None  # I - Apps no instaladas
+    # Deduplicar por deviceId o IMEI o serialNumber
+    seen, unique = set(), []
+    for d in all_devices:
+        key = d.get('deviceId') or str(d.get('imei', '')) or d.get('serialNumber', '')
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(d)
+        elif not key:
+            unique.append(d)
 
-    print('Columnas detectadas:')
-    print('  Estado MDM:  ' + str(col_estado))
-    print('  Visto:       ' + str(col_visto))
-    print('  IMEI:        ' + str(col_imei))
-    print('  Grupo:       ' + str(col_grupo))
-    print('  GPS:         ' + str(col_gps))
+    print('Total unicos: ' + str(len(unique)) + ' de ' + str(len(all_devices)) + ' descargados')
+    return token, unique
 
-    grupos = {}
-    excluidos = 0
-    dupes = set()
-    imei_count = df[col_imei].value_counts()
-    imei_dupes = set(imei_count[imei_count > 1].index)
+# ── GPS por estado ─────────────────────────────────────────────────
+def enriquecer_gps(token, grupos):
+    MAX_PER_ESTADO = 50
+    for bucket, devs in grupos.items():
+        cnt = min(len(devs), MAX_PER_ESTADO)
+        print('  GPS ' + bucket + ': ' + str(cnt) + ' dispositivos...')
+        for d in devs[:MAX_PER_ESTADO]:
+            if d['lat'] is None and d['device_id'] and d['mobile_id']:
+                lat, lng = get_device_location(token, d['device_id'], d['mobile_id'])
+                d['lat'] = lat
+                d['lng'] = lng
+        time.sleep(0.5)
 
-    for _, row in df.iterrows():
-        etiq    = row[col_etiqueta]
-        grupo   = row[col_grupo]
-        inc     = get_incidencia(etiq, grupo)
-        visto   = str(row[col_visto]).strip() if pd.notna(row[col_visto]) else ''
-        estatus = get_estatus(visto, row[col_estado], inc)
-
-        # IMEI limpio
-        imei_raw = str(row[col_imei]).strip() if pd.notna(row[col_imei]) else ''
-        try:
-            imei = str(int(float(imei_raw))) if imei_raw and imei_raw != 'nan' else ''
-        except Exception:
-            imei = imei_raw
-
-        is_dupe = (row[col_imei] in imei_dupes) if imei_dupes else False
-
-        # GPS
-        lat, lng = parse_gps(row[col_gps])
-
-        # V52 pendiente (col I)
-        v52_ni = False
-        if col_apps is not None:
-            apps_str = str(row[col_apps]).strip() if pd.notna(row[col_apps]) else ''
-            v52_ni = 'Sumate_V52-PROD-V1' in apps_str
-
-        rec = {
-            'imei':    imei,
-            'serie':   str(row[col_serie]).strip() if pd.notna(row[col_serie]) else '',
-            'etiqueta':str(etiq).strip() if not pd.isna(etiq) else '',
-            'tel':     str(row[col_tel]).replace("'","").lstrip('+').strip() if pd.notna(row[col_tel]) else '',
-            'grupo':   str(grupo).strip() if not pd.isna(grupo) else '',
-            'visto':   visto,
-            'lat':     round(lat, 6) if lat is not None else None,
-            'lng':     round(lng, 6) if lng is not None else None,
-            'inc':     inc,
-            'estatus': estatus,
-            'v52_ni':  v52_ni,
-            'dupe':    is_dupe,
-        }
-
-        bucket, tambien_cots = clasificar(grupo, etiq)
-        if bucket is None:
-            excluidos += 1
+# ── Clasificar dispositivos ────────────────────────────────────────
+def clasificar_dispositivos(devices):
+    grupos        = {}
+    sin_clasificar = 0
+    for device in devices:
+        tags    = device.get('deviceTags') or []
+        bucket  = clasificar(tags)
+        if not bucket:
+            sin_clasificar += 1
             continue
-
+        inc     = get_incidencia(tags)
+        estatus = get_estatus(device, inc)
+        label   = tags[0].get('tagValue', '') if tags else ''
+        rec = {
+            'device_id': device.get('deviceId', ''),
+            'mobile_id': device.get('mobileId', ''),
+            'imei':      str(device.get('imei', '')).replace('.0', ''),
+            'serie':     device.get('serialNumber', ''),
+            'etiqueta':  label,
+            'tel':       str(device.get('phone', '')).replace('+', ''),
+            'grupo':     ', '.join(t.get('tagValue', '') for t in tags),
+            'visto':     device.get('stdFormatLastConnectionDate', ''),
+            'lat':       None,
+            'lng':       None,
+            'inc':       inc,
+            'estatus':   estatus,
+        }
         grupos.setdefault(bucket, []).append(rec)
-        if tambien_cots:
-            grupos.setdefault('COTS_REFUERZO', []).append(rec)
-
-    print('Excluidas (sin estado): ' + str(excluidos))
+    print('Sin clasificar: ' + str(sin_clasificar))
     return grupos
 
 # ── Logo ───────────────────────────────────────────────────────────
@@ -277,26 +306,35 @@ def get_logo():
 
 # ── HTML por estado ────────────────────────────────────────────────
 def generar_html(bucket, nombre, devices, logo, fecha):
-    lats  = [d['lat'] for d in devices if d['lat'] is not None]
-    lngs  = [d['lng'] for d in devices if d['lng'] is not None]
+    lats  = [d['lat'] for d in devices if d['lat']]
+    lngs  = [d['lng'] for d in devices if d['lng']]
     clat  = round(sum(lats)/len(lats), 4) if lats else 23.6
     clng  = round(sum(lngs)/len(lngs), 4) if lngs else -102.5
     czoom = 8 if lats else 5
+
     total   = len(devices)
     con_gps = len(lats)
-    v52c    = sum(1 for d in devices if d.get('v52_ni'))
     rob     = sum(1 for d in devices if d['inc'] in ('ROBADO','EXTRAVIADO'))
     cad     = sum(1 for d in devices if d['estatus'] == 'caducada')
-    dupes   = sum(1 for d in devices if d.get('dupe'))
 
-    dj = json.dumps(devices, ensure_ascii=False, separators=(',', ':'))
+    def ser(d):
+        return {
+            'imei':     d['imei'],
+            'serie':    d['serie'],
+            'etiqueta': d['etiqueta'],
+            'tel':      d['tel'],
+            'grupo':    d['grupo'],
+            'visto':    d['visto'],
+            'lat':      d['lat'],
+            'lng':      d['lng'],
+            'inc':      d['inc'],
+            'estatus':  d['estatus'],
+        }
 
-    dupe_banner = ''
-    if dupes > 0:
-        dupe_banner = '<div style="background:#fff3cd;border-bottom:1px solid #ffc107;padding:5px 20px;font-size:11px;color:#856404;font-weight:600;">&#9888; ' + str(dupes) + ' tableta(s) con IMEI duplicado en este estado</div>'
+    dj = json.dumps([ser(d) for d in devices], ensure_ascii=False, separators=(',', ':'))
 
     css = """:root{--vino:#6D1130;--vl:#f5e8ec;--bl:#fff;--gs:#f7f4f5;--gb:#e0d4d8;--gt:#5a4a50;
---ve:#1a7a45;--ro:#b83232;--am:#c97a00;--gr:#555;--na:#d45500;--v52:#d46800;--v52l:#fff3e0;}
+--ve:#1a7a45;--ro:#b83232;--am:#c97a00;--gr:#555;--na:#d45500;}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color:#222;overflow:hidden;}
 #hd{background:var(--bl);border-bottom:4px solid var(--vino);padding:0 20px;display:flex;align-items:center;gap:14px;height:66px;z-index:1000;box-shadow:0 2px 12px rgba(109,17,48,.10);}
@@ -309,7 +347,6 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 .sc{flex:1;padding:8px 10px;border-right:1px solid rgba(255,255,255,.15);display:flex;align-items:center;gap:8px;}
 .sc:last-child{border-right:none;}
 .sn{font-family:'Barlow Condensed',sans-serif;font-size:22px;font-weight:700;color:#fff;line-height:1;}
-.sn.v52a{color:#ffd080;}
 .si{display:flex;flex-direction:column;}
 .sl{font-size:9px;color:rgba(255,255,255,.7);text-transform:uppercase;letter-spacing:.5px;}
 .ss{font-size:9px;color:rgba(255,255,255,.85);margin-top:1px;}
@@ -317,9 +354,6 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 #tb input[type=text],#tb select{border:1px solid var(--gb);border-radius:6px;padding:5px 9px;font-size:12px;font-family:'Barlow',sans-serif;color:#333;background:var(--gs);outline:none;}
 #tb input[type=text]{width:195px;}
 #tb input:focus,#tb select:focus{border-color:var(--vino);}
-.bv52{background:transparent;border:1.5px solid var(--v52);color:var(--v52);padding:5px 11px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;font-family:'Barlow',sans-serif;display:flex;align-items:center;gap:5px;}
-.bv52.on{background:var(--v52);color:#fff;}
-.sep{width:1px;height:24px;background:var(--gb);flex-shrink:0;}
 .ie{margin-left:auto;font-size:11px;color:var(--gt);background:var(--vl);padding:4px 12px;border-radius:6px;border:1px solid var(--gb);font-weight:600;white-space:nowrap;}
 #main{display:flex;height:calc(100vh - 66px - 44px - 43px);min-height:400px;}
 #map{flex:1;min-width:0;position:relative;}
@@ -343,8 +377,6 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 .card.caducada{border-left-color:var(--gr);}
 .card.robado{border-left-color:var(--na);}
 .card.sg{opacity:.75;}
-.card.v52p{box-shadow:0 0 0 1.5px var(--v52) inset;}
-.card.dupew{outline:2px solid #c97a00;}
 .card.sel{outline:2px solid var(--vino);}
 .cd{display:inline-flex;align-items:center;font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;margin-bottom:5px;}
 .cd.ok{background:#e6f4ec;color:var(--ve);}
@@ -360,14 +392,11 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 .bg.offline{background:#faeaea;color:var(--ro);}
 .bg.caducada{background:#eee;color:var(--gr);}
 .bg.robado{background:#fde8d9;color:var(--na);}
-.bg.v52{background:var(--v52l);color:var(--v52);}
 .bg.ng{background:#eee;color:#888;}
-.bg.dup{background:#fff3cd;color:#856404;}
 .cdat{display:grid;grid-template-columns:58px 1fr;gap:2px 8px;font-size:10px;margin-top:5px;}
 .cl{color:#bbb;font-size:9px;text-transform:uppercase;letter-spacing:.3px;padding-top:1px;}
 .cv{font-family:'Source Code Pro',monospace;font-size:10px;color:#333;word-break:break-all;}
 .cv.nl{font-family:'Barlow',sans-serif;}
-.cv.v52t{font-family:'Barlow',sans-serif;color:var(--v52);font-weight:600;font-size:9px;}
 #ft{background:var(--bl);border-top:3px solid var(--vino);padding:6px 20px;display:flex;align-items:center;justify-content:space-between;font-size:10px;color:var(--gt);}
 #ft .marca{color:var(--vino);font-weight:700;font-size:11px;}
 #ntf{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--vino);color:#fff;padding:9px 20px;border-radius:8px;font-size:12px;font-weight:600;z-index:9998;opacity:0;transition:opacity .3s;pointer-events:none;}
@@ -375,29 +404,25 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 @media(max-width:768px){#pn{display:none;}}"""
 
     js = """var D=""" + dj + """;
-var mp,ly,rf={},sv=false,td=[];
+var mp,ly,rf={},td=[];
 var CO={activo:'#1a7a45',offline:'#b83232',caducada:'#555',robado:'#d45500'};
 var LB={activo:'ACTIVO',offline:'OFFLINE',caducada:'LIC. CADUCADA',robado:'ROBADO/EXTRAVIADO'};
-function mi(e,v52,dp){
+function mi(e){
   var c=CO[e]||'#6D1130';
-  var rg=v52?'<circle cx="14" cy="4.5" r="4" fill="none" stroke="#d46800" stroke-width="2.5"/>':'';
-  var drg=dp?'<circle cx="24" cy="5" r="4" fill="#c97a00"/>':'';
   var s='<svg xmlns="http://www.w3.org/2000/svg" width="28" height="36" viewBox="0 0 28 36">'
     +'<path d="M14 0C6.27 0 0 6.27 0 14c0 9.25 14 22 14 22S28 23.25 28 14C28 6.27 21.73 0 14 0z" fill="'+c+'"/>'
     +'<rect x="7" y="7" width="14" height="17" rx="2" fill="white"/>'
     +'<rect x="10" y="5.5" width="8" height="2" rx="1" fill="white"/>'
     +'<rect x="9" y="10" width="10" height="1.5" rx=".5" fill="'+c+'"/>'
     +'<rect x="9" y="13" width="10" height="1.5" rx=".5" fill="'+c+'"/>'
-    +'<rect x="9" y="16" width="6" height="1.5" rx=".5" fill="'+c+'"/>'+rg+drg+'</svg>';
+    +'<rect x="9" y="16" width="6" height="1.5" rx=".5" fill="'+c+'"/></svg>';
   return L.divIcon({html:s,iconSize:[28,36],iconAnchor:[14,36],popupAnchor:[0,-38],className:''});
 }
 function mpop(d){
   var c=CO[d.estatus]||'#6D1130';
   var ub=d.lat!==null?d.lat.toFixed(5)+', '+d.lng.toFixed(5):'Sin GPS';
-  var v52r=d.v52_ni?'<tr><td class="pp">V52</td><td style="color:#d46800;font-weight:700;">&#9888; Pendiente</td></tr>':'';
   var ir=d.inc?'<tr><td class="pp">Incidencia</td><td style="color:#d45500;font-weight:700;">'+d.inc+'</td></tr>':'';
   var gr=d.grupo?'<tr><td class="pp">Grupo</td><td style="font-size:9px;color:#555;">'+d.grupo+'</td></tr>':'';
-  var dr=d.dupe?'<tr><td class="pp">Aviso</td><td style="color:#856404;font-weight:700;">IMEI duplicado</td></tr>':'';
   return '<div style="font-family:Barlow,sans-serif;min-width:240px;border-radius:6px;overflow:hidden;">'
     +'<div style="background:'+c+';color:#fff;padding:6px 12px;font-size:10px;font-weight:700;">&bull; '+(LB[d.estatus]||d.estatus.toUpperCase())+' &mdash; MDM</div>'
     +'<div style="padding:10px 12px;">'
@@ -409,15 +434,17 @@ function mpop(d){
     +'<tr><td class="pp">Tel&eacute;fono</td><td style="color:#333;">'+(d.tel||'&mdash;')+'</td></tr>'
     +'<tr><td class="pp">Visto</td><td style="color:#333;">'+(d.visto||'&mdash;')+'</td></tr>'
     +'<tr><td class="pp">Ubicaci&oacute;n</td><td style="font-family:monospace;color:#555;font-size:9px;">'+ub+'</td></tr>'
-    +gr+v52r+ir+dr+'</table></div></div>';
+    +gr+ir+'</table></div></div>';
 }
 function dc(d){
   if(d.estatus==='caducada') return 'venc';
   if(d.estatus==='robado')   return 'inc';
-  var m=(d.visto||'').match(/^(\\d+)([dhm])/);
-  if(!m) return 'ok';
-  var n=parseInt(m[1]),u=m[2],di=u==='d'?n:u==='h'?n/24:n/1440;
-  return di===0?'ok':di<=7?'warn':'danger';
+  if(!d.visto) return 'ok';
+  try{
+    var dt=new Date(d.visto);
+    var dias=(Date.now()-dt.getTime())/86400000;
+    return dias===0?'ok':dias<=7?'warn':'danger';
+  }catch(e){return 'ok';}
 }
 function mcard(d,i){
   var tg=d.lat!==null;
@@ -426,21 +453,18 @@ function mcard(d,i){
   if(d.estatus==='caducada') dt='Licencia caducada'+(d.visto?' &middot; '+d.visto:'');
   else if(d.estatus==='robado') dt=(d.inc||'Incidencia')+(d.visto?' &middot; '+d.visto:'');
   else dt=d.visto||'Sin datos';
-  var v52b=d.v52_ni?'<span class="bg v52">V52 &#9888;</span>':'';
   var gpb=!tg?'<span class="bg ng">Sin GPS</span>':'';
-  var dpb=d.dupe?'<span class="bg dup">IMEI Dup.</span>':'';
-  var v52r=d.v52_ni?'<span class="cl">Sumate V52</span><span class="cv v52t">&#9888; Pendiente</span>':'';
   var ir=d.inc?'<span class="cl">Incidencia</span><span class="cv nl" style="color:#d45500;font-weight:700;">'+d.inc+'</span>':'';
   var grr=d.grupo?'<span class="cl">Grupo</span><span class="cv nl" style="font-size:9px;color:#777;">'+(d.grupo.length>42?d.grupo.substring(0,40)+'&hellip;':d.grupo)+'</span>':'';
   var elbl=d.estatus==='caducada'?'Caducada':d.estatus==='robado'?(d.inc||'Robado'):d.estatus;
-  return '<div class="card '+d.estatus+(!tg?' sg':'')+(d.v52_ni?' v52p':'')+(d.dupe?' dupew':'')+'" data-i="'+i+'" onclick="ir('+i+')">'
+  return '<div class="card '+d.estatus+(!tg?' sg':'')+'" data-i="'+i+'" onclick="ir('+i+')">'
     +'<div class="ct"><span class="ce" title="'+(d.etiqueta||d.serie)+'">'+(d.etiqueta||d.serie)+'</span>'
-    +'<div class="bgs">'+v52b+dpb+'<span class="bg '+d.estatus+'">'+elbl+'</span>'+gpb+'</div></div>'
+    +'<div class="bgs"><span class="bg '+d.estatus+'">'+elbl+'</span>'+gpb+'</div></div>'
     +'<div class="cd '+dc(d)+'">'+dt+'</div>'
     +'<div class="cdat"><span class="cl">IMEI</span><span class="cv">'+d.imei+'</span>'
     +'<span class="cl">Serie</span><span class="cv">'+d.serie+'</span>'
     +'<span class="cl">GPS</span><span class="cv nl">'+ub+'</span>'
-    +grr+v52r+ir+'</div></div>';
+    +grr+ir+'</div></div>';
 }
 function rend(lista){
   ly.clearLayers();rf={};
@@ -448,22 +472,22 @@ function rend(lista){
   for(var i=0;i<lista.length;i++){
     var d=lista[i];
     if(d.lat!==null){
-      var mk=L.marker([d.lat,d.lng],{icon:mi(d.estatus,d.v52_ni,d.dupe)});
+      var mk=L.marker([d.lat,d.lng],{icon:mi(d.estatus)});
       mk.bindPopup(mpop(d),{maxWidth:290});mk.addTo(ly);rf[i]={mk:mk,d:d};
     }
     el.insertAdjacentHTML('beforeend',mcard(d,i));
   }
-  var t=lista.length,g=0,v52n=0,inc=0,cad=0;
+  var t=lista.length,g=0,act=0,inc=0,cad=0;
   for(var j=0;j<lista.length;j++){
     if(lista[j].lat!==null) g++;
-    if(lista[j].v52_ni) v52n++;
+    if(lista[j].estatus==='activo') act++;
     if(lista[j].inc) inc++;
     if(lista[j].estatus==='caducada') cad++;
   }
   document.getElementById('s0').textContent=t;
   document.getElementById('s1').textContent=g;
   document.getElementById('s2').textContent=t-g;
-  document.getElementById('s3').textContent=v52n;
+  document.getElementById('s3').textContent=act;
   document.getElementById('s4').textContent=inc;
   document.getElementById('s5').textContent=cad;
   document.getElementById('pc').textContent=t+' tabletas \u00b7 clic para centrar';
@@ -476,23 +500,16 @@ function ir(i){
   var r=rf[i];if(!r){ntf('Sin GPS registrado');return;}
   mp.setView([r.d.lat,r.d.lng],15);r.mk.openPopup();
 }
-function tv(){
-  sv=!sv;
-  document.getElementById('bv').classList.toggle('on',sv);
-  fil();
-}
 function fil(){
   var q=document.getElementById('bq').value.toLowerCase();
-  var fe=document.getElementById('fe').value;
-  var fg=document.getElementById('fg').value;
+  var fe=document.getElementById('fe').value,fg=document.getElementById('fg').value;
   var l=[];
   for(var i=0;i<td.length;i++){
     var d=td[i];
     var mq=!q||[d.imei,d.serie,d.etiqueta,d.tel,d.grupo].some(function(v){return (v||'').toLowerCase().indexOf(q)>=0;});
     var me=!fe||d.estatus===fe;
     var mg=!fg||(fg==='con'&&d.lat!==null)||(fg==='sin'&&d.lat===null);
-    var mv=!sv||d.v52_ni;
-    if(mq&&me&&mg&&mv) l.push(d);
+    if(mq&&me&&mg) l.push(d);
   }
   rend(l);
 }
@@ -530,12 +547,11 @@ window.addEventListener('load',function(){
   <div class="tt"><h1>MORENA - Estructura - """ + nombre + """</h1><p>Monitoreo de tabletas - """ + fecha + """</p></div>
   <div class="ac"><strong>""" + fecha + """</strong>Actualizacion automatica</div>
 </div>
-""" + dupe_banner + """
 <div id="st">
   <div class="sc"><div class="sn" id="s0">0</div><div class="si"><span class="sl">Total</span><span class="ss">Tabletas</span></div></div>
   <div class="sc"><div class="sn" id="s1">0</div><div class="si"><span class="sl">Con GPS</span><span class="ss">Ubicadas</span></div></div>
   <div class="sc"><div class="sn" id="s2">0</div><div class="si"><span class="sl">Sin GPS</span><span class="ss">Solo lista</span></div></div>
-  <div class="sc"><div class="sn v52a" id="s3">0</div><div class="si"><span class="sl">V52 Pendiente</span><span class="ss">Sin instalar</span></div></div>
+  <div class="sc"><div class="sn" id="s3">0</div><div class="si"><span class="sl">Activas</span><span class="ss">0-3 dias</span></div></div>
   <div class="sc"><div class="sn" id="s4">0</div><div class="si"><span class="sl">Incidencias</span><span class="ss">Robado/Extraviado</span></div></div>
   <div class="sc"><div class="sn" id="s5">0</div><div class="si"><span class="sl">Lic. Caducada</span><span class="ss">Sin renovar</span></div></div>
 </div>
@@ -553,12 +569,7 @@ window.addEventListener('load',function(){
     <option value="con">Solo con GPS</option>
     <option value="sin">Solo sin GPS</option>
   </select>
-  <div class="sep"></div>
-  <button class="bv52" id="bv" onclick="tv()">
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-    Solo V52 Pendiente
-  </button>
-  <span class="ie">""" + nombre + """ - """ + str(total) + """ tab - """ + str(con_gps) + """ GPS - """ + str(v52c) + """ V52 pend.</span>
+  <span class="ie">""" + nombre + """ - """ + str(total) + """ tab - """ + str(con_gps) + """ GPS - """ + str(rob) + """ incid. - """ + str(cad) + """ caducadas</span>
 </div>
 <div id="main">
   <div id="map">
@@ -568,12 +579,10 @@ window.addEventListener('load',function(){
       <div class="lr"><div class="ld" style="background:#b83232"></div><span>Offline (4+ dias)</span></div>
       <div class="lr"><div class="ld" style="background:#555"></div><span>Lic. Caducada</span></div>
       <div class="lr"><div class="ld" style="background:#d45500"></div><span>Robado / Extraviado</span></div>
-      <div class="lsep"></div>
-      <div class="lr"><div style="width:10px;height:10px;border-radius:50%;border:2.5px solid #d46800;flex-shrink:0;"></div><span style="color:#d46800;font-weight:600;">V52 Pendiente</span></div>
     </div>
   </div>
   <div id="pn">
-    <div id="ph"><h3>""" + nombre + """</h3><p id="pc">""" + str(total) + """ tabletas</p></div>
+    <div id="ph"><h3>""" + nombre + """</h3><p id="pc">""" + str(total) + """ tabletas - clic para centrar</p></div>
     <div id="lista"></div>
   </div>
 </div>
@@ -593,24 +602,15 @@ window.addEventListener('load',function(){
 # ── Index ──────────────────────────────────────────────────────────
 def generar_index(grupos, fecha):
     filas = ''
-    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS']
-    total_gral = 0
+    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS', 'DISTRITALES', 'FINANZAS']
     for b in orden:
         if b not in grupos:
             continue
         key, nombre = ESTADOS[b]
         total   = len(grupos[b])
-        con_gps = sum(1 for d in grupos[b] if d['lat'] is not None)
-        v52c    = sum(1 for d in grupos[b] if d.get('v52_ni'))
+        con_gps = sum(1 for d in grupos[b] if d['lat'])
         rob     = sum(1 for d in grupos[b] if d['inc'] in ('ROBADO', 'EXTRAVIADO'))
-        if b not in ('COTS_REFUERZO', 'DISTRITALES', 'FINANZAS'):
-            total_gral += total
-        filas += ('<tr><td>' + b + '</td>'
-                  '<td><a href="' + b + '_' + key + '.html">' + nombre + '</a></td>'
-                  '<td>' + str(total) + '</td>'
-                  '<td>' + str(con_gps) + '</td>'
-                  '<td>' + str(v52c) + '</td>'
-                  '<td>' + str(rob) + '</td></tr>\n')
+        filas  += '<tr><td>' + b + '</td><td><a href="' + b + '_' + key + '.html">' + nombre + '</a></td><td>' + str(total) + '</td><td>' + str(con_gps) + '</td><td>' + str(rob) + '</td></tr>\n'
 
     return """<!DOCTYPE html>
 <html lang="es">
@@ -632,9 +632,9 @@ a:hover{text-decoration:underline;}
 </head>
 <body>
 <h1>MORENA - Tenant Estructura - Indice de Mapas</h1>
-<p>Ultima actualizacion: """ + fecha + """ - Se actualiza al subir un nuevo Excel</p>
+<p>Ultima actualizacion: """ + fecha + """ - Actualizacion automatica cada 2 horas</p>
 <table>
-<tr><th>#</th><th>Entidad</th><th>Total</th><th>Con GPS</th><th>V52 Pend.</th><th>Incidencias</th></tr>
+<tr><th>#</th><th>Entidad</th><th>Total</th><th>Con GPS</th><th>Incidencias</th></tr>
 """ + filas + """</table>
 </body>
 </html>"""
@@ -645,11 +645,16 @@ if __name__ == '__main__':
     OUTPUT_DIR.mkdir(exist_ok=True)
     logo = get_logo()
 
-    df     = leer_excel()
-    grupos = procesar_df(df)
+    token, devices = descargar_dispositivos()
+
+    print('Clasificando dispositivos...')
+    grupos = clasificar_dispositivos(devices)
+
+    print('Obteniendo GPS...')
+    enriquecer_gps(token, grupos)
 
     print('Generando HTML...')
-    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS']
+    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS', 'DISTRITALES', 'FINANZAS']
     for bucket in orden:
         if bucket not in grupos:
             continue
@@ -658,9 +663,7 @@ if __name__ == '__main__':
         html     = generar_html(bucket, nombre, devs, logo, FECHA_HOY)
         out_file = OUTPUT_DIR / (bucket + '_' + key + '.html')
         out_file.write_text(html, encoding='utf-8')
-        t = len(devs)
-        g = sum(1 for d in devs if d['lat'] is not None)
-        print('  OK ' + bucket + ' ' + nombre + ': ' + str(t) + ' tab, ' + str(g) + ' GPS')
+        print('  OK ' + bucket + ' ' + nombre + ': ' + str(len(devs)) + ' tabletas')
 
     index_html = generar_index(grupos, FECHA_HOY)
     (OUTPUT_DIR / 'index.html').write_text(index_html, encoding='utf-8')
