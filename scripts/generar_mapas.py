@@ -120,13 +120,21 @@ def get_token():
     r.raise_for_status()
     return r.json()['access_token']
 
-def get_device_list(token, page_num=1):
+   def get_device_list(token, page_num=1):
     r = requests.post(
         f"{KNOX_BASE}/emm/oapi/device/selectDeviceList",
         headers={'Authorization': f'bearer {token}'},
-        data={'pageNum': str(page_num), 'pageSize': '1000'},
+        data={
+            'pageNum':  str(page_num),
+            'pageSize': '1000',
+            'startNum': str((page_num - 1) * 1000),  # offset alternativo
+        },
         timeout=60
-    )
+if page_num <= 2:
+        imeis = [d.get('imei','') for d in rv.get('deviceList',[])[:3]]
+        print(f"  p{page_num} primeros IMEIs: {imeis}")
+
+    )    )
     r.raise_for_status()
     data = r.json()
     rv   = data.get('resultValue', {})
