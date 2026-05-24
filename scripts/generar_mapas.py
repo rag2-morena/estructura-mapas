@@ -13,7 +13,9 @@ KNOX_BASE    = os.environ['KNOX_BASE_URL'].rstrip('/')
 KNOX_CLIENT  = os.environ['KNOX_CLIENT_ID']   # knox-estructura@morena.si
 KNOX_SECRET  = os.environ['KNOX_SECRET']
 OUTPUT_DIR   = Path('docs')
-FECHA_HOY    = datetime.utcnow().strftime('%d/%m/%Y %H:%M UTC')
+from datetime import timezone, timedelta
+ZONA_MEXICO = timezone(timedelta(hours=-6))
+FECHA_HOY   = datetime.now(ZONA_MEXICO).strftime('%d/%m/%Y %H:%M hora Centro')
 
 ESTADOS = {
     '01':('Aguascalientes','Aguascalientes'),
