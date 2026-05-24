@@ -216,13 +216,15 @@ def descargar_dispositivos():
         page_num += 1
         time.sleep(1)  # respetar rate limit
 
-    # Deduplicar
+# Deduplicar por deviceId o IMEI o serialNumber
     seen, unique = set(), []
     for d in all_devices:
-        if d.get('deviceId') not in seen:
-            seen.add(d.get('deviceId'))
+        key = d.get('deviceId') or str(d.get('imei','')) or d.get('serialNumber','')
+        if key and key not in seen:
+            seen.add(key)
             unique.append(d)
-
+        elif not key:
+            unique.append(d)
     print(f"Total únicos: {len(unique)}")
     return token, unique
 
