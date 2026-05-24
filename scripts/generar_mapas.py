@@ -632,7 +632,7 @@ a:hover{text-decoration:underline;}
 </head>
 <body>
 <h1>MORENA - Tenant Estructura - Indice de Mapas</h1>
-<p>Ultima actualizacion: """ + fecha + """ - Se actualiza al subir un nuevo Excel</p>
+<p>Ultima actualizacion: """ + fecha + """</p>
 <table>
 <tr><th>#</th><th>Entidad</th><th>Total</th><th>Con GPS</th><th>V52 Pend.</th><th>Incidencias</th></tr>
 """ + filas + """</table>
