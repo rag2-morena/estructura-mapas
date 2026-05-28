@@ -8,13 +8,13 @@ import pandas as pd
 import json, os, re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-
+ 
 # ── Configuracion ──────────────────────────────────────────────────
 OUTPUT_DIR  = Path('docs')
 DATA_DIR    = Path('data')
 ZONA_MEXICO = timezone(timedelta(hours=-6))
 FECHA_HOY   = datetime.now(ZONA_MEXICO).strftime('%d/%m/%Y %H:%M hora Centro')
-
+ 
 ESTADOS = {
     '01':('Aguascalientes','Aguascalientes'),
     '02':('Baja_California','Baja California'),
@@ -51,8 +51,10 @@ ESTADOS = {
     'COTS_REFUERZO':('COTS_Refuerzo','COTS Refuerzo'),
     'DISTRITALES':('Distritales','Distritales'),
     'FINANZAS':('Finanzas','Finanzas'),
+    'BRIGADISTAS':('Brigadistas','Brigadistas'),
+    'PROCESO_COAHUILA':('Proceso_Coahuila','Proceso Coahuila'),
 }
-
+ 
 ETIQUETA_MAP = {}
 _base = {
     '01':['01_Aguascalientes','1_Aguascalientes'],
@@ -103,7 +105,7 @@ ETIQUETA_MAP.update({
     'Estruct_SLP_ROBADOS':'24','11_Guanajuato_ROBADOS':'11',
     '_EDOMEX_ROBADOS':'15',
 })
-
+ 
 # ── Parsear GPS ────────────────────────────────────────────────────
 def parse_gps(val):
     if pd.isna(val) or str(val).strip() == '':
@@ -112,51 +114,74 @@ def parse_gps(val):
     if m:
         return float(m.group(1)), float(m.group(2))
     return None, None
-
+ 
 # ── Clasificacion ──────────────────────────────────────────────────
 def clasificar(grupo_raw, etiqueta_raw):
     g = str(grupo_raw).strip() if not pd.isna(grupo_raw) else ''
     e = str(etiqueta_raw).strip() if not pd.isna(etiqueta_raw) else ''
     tokens = [t.strip() for t in g.split(',') if t.strip()]
-
+ 
     if e.startswith('Fin_') or e == 'Finanzas':
         return 'FINANZAS', False
-
-    estados_grupo = []
-    for tok in tokens:
-        m = re.match(r'^(\d{2})_(?:Estructura|Proceso)_', tok, re.I)
-        if m and m.group(1).zfill(2) in ESTADOS:
-            estados_grupo.append(m.group(1).zfill(2))
-
-    tiene_cots   = any(re.match(r'^05_COTS-REFUERZO$', t, re.I) for t in tokens)
-    tiene_brigad = any(re.match(r'^05_Estructura_BRIGADISTAS$', t, re.I) for t in tokens)
-    tiene_dist   = any(t.upper() == 'DISTRITALES' for t in tokens)
-    tiene_fin    = any(t.upper() == 'FINANZAS' for t in tokens)
-
-    if estados_grupo:
-        return estados_grupo[0], tiene_cots
+ 
+    # BRIGADISTAS en cualquier token -> siempre va a su bucket propio
+    tiene_brigad = any(re.match(r'^05_Estructura_BRIGADISTAS', t, re.I) for t in tokens)
     if tiene_brigad:
-        return '05', False
-    if tiene_cots:
-        return 'COTS_REFUERZO', False
-    if tiene_dist:
-        return 'DISTRITALES', False
-    if tiene_fin:
-        return 'FINANZAS', False
+        return 'BRIGADISTAS', False
+ 
+    # Separar tokens Estructura vs Proceso
+    estructura_tokens = []
+    proceso_tokens    = []
+    for tok in tokens:
+        m_est  = re.match(r'^(\d{2})_Estructura_', tok, re.I)
+        m_proc = re.match(r'^(\d{2})_Proceso_', tok, re.I)
+        if m_est and m_est.group(1).zfill(2) in ESTADOS:
+            estructura_tokens.append(m_est.group(1).zfill(2))
+        elif m_proc and m_proc.group(1).zfill(2) in ESTADOS:
+            proceso_tokens.append(m_proc.group(1).zfill(2))
+ 
+    tiene_cots      = any(re.match(r'^05_COTS-REFUERZO$', t, re.I) for t in tokens)
+    tiene_dist      = any(t.upper() == 'DISTRITALES' for t in tokens)
+    tiene_fin       = any(t.upper() == 'FINANZAS' for t in tokens)
+    tiene_proc_coah = any(re.match(r'^05_Proceso_COAHUILA', t, re.I) for t in tokens)
+ 
+    # Estructura prevalece sobre Proceso, menor numero primero
+    if estructura_tokens:
+        return sorted(estructura_tokens)[0], tiene_cots
+ 
+    # Solo Proceso
+    if proceso_tokens:
+        if tiene_proc_coah and all(p == '05' for p in proceso_tokens):
+            return 'PROCESO_COAHUILA', False
+        otros = sorted([p for p in proceso_tokens if p != '05'])
+        if otros:
+            return otros[0], False
+        return 'PROCESO_COAHUILA', False
+ 
+    if tiene_cots:   return 'COTS_REFUERZO', False
+    if tiene_dist:   return 'DISTRITALES', False
+    if tiene_fin:    return 'FINANZAS', False
+ 
     if e in ETIQUETA_MAP:
         return ETIQUETA_MAP[e], False
-    if 'REF_PROCESO_RS' in e.upper() or 'PROCESO_COAHUILA' in e.upper():
-        return '05', False
-
+    m2 = re.match(r'^(\d{2})_', e)
+    if m2 and m2.group(1).zfill(2) in ESTADOS:
+        return m2.group(1).zfill(2), False
+    m1 = re.match(r'^(\d)_', e)
+    if m1 and '0'+m1.group(1) in ESTADOS:
+        return '0'+m1.group(1), False
+    if 'PROCESO_COAHUILA' in e.upper():
+        return 'PROCESO_COAHUILA', False
+ 
     return None, False
-
+ 
 def get_incidencia(etiqueta, grupo):
     t = ((str(etiqueta) if not pd.isna(etiqueta) else '') + ' ' +
          (str(grupo) if not pd.isna(grupo) else '')).upper()
     if 'ROBADO' in t:     return 'ROBADO'
     if 'EXTRAVIADO' in t: return 'EXTRAVIADO'
     return ''
-
+ 
 def get_estatus(visto_str, estado_mdm, inc):
     if inc in ('ROBADO', 'EXTRAVIADO'):
         return 'robado'
@@ -175,21 +200,21 @@ def get_estatus(visto_str, estado_mdm, inc):
         if dias <= 60: return 'offline'
         return 'caducada'
     return 'activo'
-
+ 
 # ── Leer Excel ────────────────────────────────────────────────────
 def leer_excel():
     # Buscar el Excel en la carpeta data/
     excels = list(DATA_DIR.glob('*.xlsx')) + list(DATA_DIR.glob('*.xls'))
     if not excels:
         raise FileNotFoundError('No se encontro ningun archivo Excel en la carpeta data/')
-
+ 
     xlsx = sorted(excels)[-1]  # el mas reciente
     print('Leyendo Excel: ' + str(xlsx))
     df = pd.read_excel(xlsx)
     print('Total filas: ' + str(len(df)))
     print('Columnas: ' + str(df.columns.tolist()))
     return df
-
+ 
 # ── Clasificar filas ───────────────────────────────────────────────
 def procesar_df(df):
     # Detectar columnas por posicion (A=0, B=1, ... I=8)
@@ -202,45 +227,45 @@ def procesar_df(df):
     col_grupo    = df.columns[6]   # G - Grupo asignado
     col_gps      = df.columns[7]   # H - Ultima ubicacion
     col_apps     = df.columns[8] if len(df.columns) > 8 else None  # I - Apps no instaladas
-
+ 
     print('Columnas detectadas:')
     print('  Estado MDM:  ' + str(col_estado))
     print('  Visto:       ' + str(col_visto))
     print('  IMEI:        ' + str(col_imei))
     print('  Grupo:       ' + str(col_grupo))
     print('  GPS:         ' + str(col_gps))
-
+ 
     grupos = {}
     excluidos = 0
     dupes = set()
     imei_count = df[col_imei].value_counts()
     imei_dupes = set(imei_count[imei_count > 1].index)
-
+ 
     for _, row in df.iterrows():
         etiq    = row[col_etiqueta]
         grupo   = row[col_grupo]
         inc     = get_incidencia(etiq, grupo)
         visto   = str(row[col_visto]).strip() if pd.notna(row[col_visto]) else ''
         estatus = get_estatus(visto, row[col_estado], inc)
-
+ 
         # IMEI limpio
         imei_raw = str(row[col_imei]).strip() if pd.notna(row[col_imei]) else ''
         try:
             imei = str(int(float(imei_raw))) if imei_raw and imei_raw != 'nan' else ''
         except Exception:
             imei = imei_raw
-
+ 
         is_dupe = (row[col_imei] in imei_dupes) if imei_dupes else False
-
+ 
         # GPS
         lat, lng = parse_gps(row[col_gps])
-
+ 
         # V52 pendiente (col I)
         v52_ni = False
         if col_apps is not None:
             apps_str = str(row[col_apps]).strip() if pd.notna(row[col_apps]) else ''
             v52_ni = 'Sumate_V52-PROD-V1' in apps_str
-
+ 
         rec = {
             'imei':    imei,
             'serie':   str(row[col_serie]).strip() if pd.notna(row[col_serie]) else '',
@@ -255,26 +280,26 @@ def procesar_df(df):
             'v52_ni':  v52_ni,
             'dupe':    is_dupe,
         }
-
+ 
         bucket, tambien_cots = clasificar(grupo, etiq)
         if bucket is None:
             excluidos += 1
             continue
-
+ 
         grupos.setdefault(bucket, []).append(rec)
         if tambien_cots:
             grupos.setdefault('COTS_REFUERZO', []).append(rec)
-
+ 
     print('Excluidas (sin estado): ' + str(excluidos))
     return grupos
-
+ 
 # ── Logo ───────────────────────────────────────────────────────────
 def get_logo():
     logo_path = Path('scripts/logo.b64')
     if logo_path.exists():
         return logo_path.read_text().strip()
     return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQAABjE+ibYAAAAASUVORK5CYII='
-
+ 
 # ── HTML por estado ────────────────────────────────────────────────
 def generar_html(bucket, nombre, devices, logo, fecha):
     lats  = [d['lat'] for d in devices if d['lat'] is not None]
@@ -288,13 +313,13 @@ def generar_html(bucket, nombre, devices, logo, fecha):
     rob     = sum(1 for d in devices if d['inc'] in ('ROBADO','EXTRAVIADO'))
     cad     = sum(1 for d in devices if d['estatus'] == 'caducada')
     dupes   = sum(1 for d in devices if d.get('dupe'))
-
+ 
     dj = json.dumps(devices, ensure_ascii=False, separators=(',', ':'))
-
+ 
     dupe_banner = ''
     if dupes > 0:
         dupe_banner = '<div style="background:#fff3cd;border-bottom:1px solid #ffc107;padding:5px 20px;font-size:11px;color:#856404;font-weight:600;">&#9888; ' + str(dupes) + ' tableta(s) con IMEI duplicado en este estado</div>'
-
+ 
     css = """:root{--vino:#6D1130;--vl:#f5e8ec;--bl:#fff;--gs:#f7f4f5;--gb:#e0d4d8;--gt:#5a4a50;
 --ve:#1a7a45;--ro:#b83232;--am:#c97a00;--gr:#555;--na:#d45500;--v52:#d46800;--v52l:#fff3e0;}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
@@ -373,7 +398,7 @@ html,body{height:100%;font-family:'Barlow',sans-serif;background:var(--gs);color
 #ntf{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--vino);color:#fff;padding:9px 20px;border-radius:8px;font-size:12px;font-weight:600;z-index:9998;opacity:0;transition:opacity .3s;pointer-events:none;}
 #ntf.on{opacity:1;}
 @media(max-width:768px){#pn{display:none;}}"""
-
+ 
     js = """var D=""" + dj + """;
 var mp,ly,rf={},sv=false,td=[];
 var CO={activo:'#1a7a45',offline:'#b83232',caducada:'#555',robado:'#d45500'};
@@ -512,7 +537,7 @@ window.addEventListener('load',function(){
   var cg=[];for(var i=0;i<td.length;i++){if(td[i].lat!==null)cg.push([td[i].lat,td[i].lng]);}
   if(cg.length>0)mp.fitBounds(cg,{padding:[40,40],maxZoom:11});
 });"""
-
+ 
     return """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -588,12 +613,12 @@ window.addEventListener('load',function(){
 </script>
 </body>
 </html>"""
-
-
+ 
+ 
 # ── Index ──────────────────────────────────────────────────────────
 def generar_index(grupos, fecha):
     filas = ''
-    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS']
+    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS', 'BRIGADISTAS', 'PROCESO_COAHUILA']
     total_gral = 0
     for b in orden:
         if b not in grupos:
@@ -611,7 +636,7 @@ def generar_index(grupos, fecha):
                   '<td>' + str(con_gps) + '</td>'
                   '<td>' + str(v52c) + '</td>'
                   '<td>' + str(rob) + '</td></tr>\n')
-
+ 
     return """<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -632,24 +657,24 @@ a:hover{text-decoration:underline;}
 </head>
 <body>
 <h1>MORENA - Tenant Estructura - Indice de Mapas</h1>
-<p>Ultima actualizacion: """ + fecha + """</p>
+<p>Ultima actualizacion: """ + fecha + """ - Se actualiza al subir un nuevo Excel</p>
 <table>
 <tr><th>#</th><th>Entidad</th><th>Total</th><th>Con GPS</th><th>V52 Pend.</th><th>Incidencias</th></tr>
 """ + filas + """</table>
 </body>
 </html>"""
-
-
+ 
+ 
 # ── Main ───────────────────────────────────────────────────────────
 if __name__ == '__main__':
     OUTPUT_DIR.mkdir(exist_ok=True)
     logo = get_logo()
-
+ 
     df     = leer_excel()
     grupos = procesar_df(df)
-
+ 
     print('Generando HTML...')
-    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS']
+    orden = [str(n).zfill(2) for n in range(1, 33)] + ['COTS_REFUERZO', 'DISTRITALES', 'FINANZAS', 'BRIGADISTAS', 'PROCESO_COAHUILA']
     for bucket in orden:
         if bucket not in grupos:
             continue
@@ -661,7 +686,7 @@ if __name__ == '__main__':
         t = len(devs)
         g = sum(1 for d in devs if d['lat'] is not None)
         print('  OK ' + bucket + ' ' + nombre + ': ' + str(t) + ' tab, ' + str(g) + ' GPS')
-
+ 
     index_html = generar_index(grupos, FECHA_HOY)
     (OUTPUT_DIR / 'index.html').write_text(index_html, encoding='utf-8')
     print('Completado: ' + str(len(grupos)) + ' archivos generados en docs/')
